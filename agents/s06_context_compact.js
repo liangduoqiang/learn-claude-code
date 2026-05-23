@@ -32,23 +32,20 @@
 // 【核心理念】Agent 可以"选择性遗忘"来永久工作。
 //             重要的是区分什么该保留（文件内容）、什么可以丢弃（命令输出历史）。
 
-import Anthropic from "@anthropic-ai/sdk";
+import { createLlmClient, getModel } from "./llm_client.js";
+import { createFlowContext } from "./exec_flow.js";
 import { execSync } from "child_process";
 import * as readline from "readline";
 import * as dotenv from "dotenv";
 import * as fs from "fs";
 import * as path from "path";
-import * as process from "process";
 
 dotenv.config({ override: true });
 
-if (process.env.ANTHROPIC_BASE_URL) {
-  delete process.env.ANTHROPIC_AUTH_TOKEN;
-}
-
 const WORKDIR = process.cwd();
-const client = new Anthropic({ baseURL: process.env.ANTHROPIC_BASE_URL });
-const MODEL = process.env.MODEL_ID;
+const client = createLlmClient();
+const MODEL = getModel();
+const flow = createFlowContext("s06");
 
 const SYSTEM = `你是一个工作在 ${WORKDIR} 目录的编程智能体。使用工具完成任务。`;
 
@@ -138,7 +135,7 @@ async function autoCompact(messages) {
   const transcriptPath = path.join(TRANSCRIPT_DIR, `transcript_${Date.now()}.jsonl`);
   const lines = messages.map((msg) => JSON.stringify(msg)).join("\n");
   fs.writeFileSync(transcriptPath, lines, "utf8");
-  console.log(`[对话记录已保存：${transcriptPath}]`);
+  console.log(`对话记录已保存：${transcriptPath}`);
 
   // 取最后 80000 字符（防止摘要请求本身超出限制）
   const conversationText = JSON.stringify(messages).slice(-80000);
@@ -312,16 +309,19 @@ const TOOLS = [
 async function agentLoop(messages) {
   while (true) {
     // 第一层：每轮都静默执行微型压缩
+    const tokensBefore = estimateTokens(messages);
     microCompact(messages);
+    flow.infra("micro_compact", { tokensBefore, tokensAfter: estimateTokens(messages) });
 
     // 第二层：token 估计超过阈值时触发自动全量压缩
     if (estimateTokens(messages) > THRESHOLD) {
-      console.log("[自动压缩已触发]");
+      flow.infra("auto_compact 触发", { tokens: estimateTokens(messages), threshold: THRESHOLD });
       const compacted = await autoCompact(messages);
       // 就地替换 messages 数组的所有内容（保留引用）
       messages.splice(0, messages.length, ...compacted);
     }
 
+    flow.llmRequest(messages.length, SYSTEM);
     const response = await client.messages.create({
       model: MODEL,
       system: SYSTEM,
@@ -329,6 +329,7 @@ async function agentLoop(messages) {
       tools: TOOLS,
       max_tokens: 8000,
     });
+    flow.llmResponse(response);
 
     messages.push({ role: "assistant", content: response.content });
 
@@ -353,8 +354,7 @@ async function agentLoop(messages) {
             output = `错误：${e.message}`;
           }
         }
-        console.log(`> ${block.name}:`);
-        console.log(String(output).slice(0, 200));
+        flow.toolUse(block, output);
         results.push({
           type: "tool_result",
           tool_use_id: block.id,
@@ -367,7 +367,7 @@ async function agentLoop(messages) {
 
     // 第三层：模型主动调用 compact 工具时触发手动压缩
     if (manualCompact) {
-      console.log("[手动压缩]");
+      flow.infra("manual_compact", { tokens: estimateTokens(messages) });
       const compacted = await autoCompact(messages);
       messages.splice(0, messages.length, ...compacted);
       return;  // 压缩后结束本轮，等待下一次用户输入
@@ -401,13 +401,14 @@ async function main() {
     }
 
     history.push({ role: "user", content: query });
+    flow.userTurn(query);
     await agentLoop(history);
 
     const last = history[history.length - 1];
     if (Array.isArray(last.content)) {
       for (const block of last.content) {
         if (block.type === "text") {
-          process.stdout.write(block.text);
+          process.stdout.write(`LLM 回复：${block.text}`);
         }
       }
     }
@@ -418,6 +419,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(err);
+  console.error("程序异常：", err);
   process.exit(1);
 });

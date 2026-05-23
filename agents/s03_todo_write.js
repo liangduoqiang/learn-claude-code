@@ -25,23 +25,20 @@
 // 【核心理念】Agent 可以追踪自己的进度——而且我们人类也能看到。
 //             这解决了 LLM 做复杂任务时"忘记步骤"的问题。
 
-import Anthropic from "@anthropic-ai/sdk";
+import { createLlmClient, getModel } from "./llm_client.js";
+import { createFlowContext } from "./exec_flow.js";
 import { execSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import * as readline from "readline";
 import * as dotenv from "dotenv";
-import * as process from "process";
 
 dotenv.config({ override: true });
 
-if (process.env.ANTHROPIC_BASE_URL) {
-  delete process.env.ANTHROPIC_AUTH_TOKEN;
-}
-
 const WORKDIR = process.cwd();
-const client = new Anthropic({ baseURL: process.env.ANTHROPIC_BASE_URL });
-const MODEL = process.env.MODEL_ID;
+const client = createLlmClient();
+const MODEL = getModel();
+const flow = createFlowContext("s03");
 
 // 系统提示中明确要求使用 todo 工具规划多步任务
 const SYSTEM = `你是一个工作在 ${WORKDIR} 目录的编程智能体。
@@ -263,6 +260,7 @@ async function agentLoop(messages) {
   let roundsSinceTodo = 0;  // 上次更新 todo 后经过的轮数
 
   while (true) {
+    flow.llmRequest(messages.length, SYSTEM);
     const response = await client.messages.create({
       model: MODEL,
       system: SYSTEM,
@@ -270,6 +268,7 @@ async function agentLoop(messages) {
       tools: TOOLS,
       max_tokens: 8000,
     });
+    flow.llmResponse(response);
 
     messages.push({ role: "assistant", content: response.content });
 
@@ -287,8 +286,11 @@ async function agentLoop(messages) {
         } catch (e) {
           output = `错误：${e.message}`;
         }
-        console.log(`> ${block.name}:`);
-        console.log(String(output).slice(0, 200));
+        const outStr = String(output);
+        flow.toolUse(block, outStr);
+        if (block.name === "todo") {
+          flow.infra("待办状态", { items: TODO.items.length });
+        }
         results.push({
           type: "tool_result",
           tool_use_id: block.id,
@@ -304,6 +306,7 @@ async function agentLoop(messages) {
     // 超过 3 轮没更新 todo → 注入催促提醒
     // 这条提醒会成为对话历史的一部分，LLM 下轮会看到它
     if (roundsSinceTodo >= 3) {
+      flow.infra("todo 催促", { roundsSinceTodo });
       results.push({ type: "text", text: "<reminder>请更新你的待办列表。</reminder>" });
     }
 
@@ -332,12 +335,17 @@ async function main() {
     if (!query || ["q", "exit"].includes(query.trim().toLowerCase())) break;
 
     history.push({ role: "user", content: query });
+    flow.userTurn(query);
     await agentLoop(history);
+
+    if (TODO.items.length > 0) {
+      flow.infra("回合结束待办快照", { plan: TODO.render() });
+    }
 
     const last = history[history.length - 1];
     if (Array.isArray(last.content)) {
       for (const block of last.content) {
-        if (block.type === "text") process.stdout.write(block.text);
+        if (block.type === "text") process.stdout.write(`LLM 回复：${block.text}`);
       }
     }
     console.log();
@@ -347,6 +355,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(err);
+  console.error("程序异常：", err);
   process.exit(1);
 });

@@ -32,7 +32,8 @@
 //             命令完成时回调函数把结果推入通知队列
 //             下一次 LLM 调用前消费队列，把结果作为消息注入
 
-import Anthropic from "@anthropic-ai/sdk";
+import { createLlmClient, getModel } from "./llm_client.js";
+import { createFlowContext } from "./exec_flow.js";
 import { execSync, exec } from "child_process";  // exec 是异步版本！
 import * as fs from "fs";
 import * as path from "path";
@@ -42,13 +43,9 @@ import { randomUUID } from "crypto";
 
 dotenv.config({ override: true });
 
-if (process.env.ANTHROPIC_BASE_URL) {
-  delete process.env.ANTHROPIC_AUTH_TOKEN;
-}
-
 const WORKDIR = process.cwd();
-const client = new Anthropic({ baseURL: process.env.ANTHROPIC_BASE_URL });
-const MODEL = process.env.MODEL_ID;
+const client = createLlmClient();
+const MODEL = getModel();
 
 const SYSTEM = `你是一个工作在 ${WORKDIR} 目录的编程智能体。对长时间运行的命令使用 background_run 工具。`;
 
@@ -76,6 +73,7 @@ class BackgroundManager {
   run(command) {
     const taskId = randomUUID().slice(0, 8);  // 生成简短的唯一 ID
     this.tasks[taskId] = { status: "running", result: null, command };
+    flow.infra("后台任务创建", { taskId, command: command.slice(0, 200) });
     this._execute(taskId, command);  // 异步执行，不等待
     return `后台任务 ${taskId} 已启动：${command.slice(0, 80)}`;
   }
@@ -98,6 +96,11 @@ class BackgroundManager {
       }
       this.tasks[taskId].status = status;
       this.tasks[taskId].result = output || "(无输出)";
+      flow.infra("后台任务完成", {
+        taskId,
+        status,
+        resultPreview: (output || "(无输出)").slice(0, 200),
+      });
 
       // 把完成通知推入队列（等待 LLM 下次调用前消费）
       this._notificationQueue.push({
@@ -132,6 +135,7 @@ class BackgroundManager {
 }
 
 const BG = new BackgroundManager();
+const flow = createFlowContext("s08");
 
 
 // 路径安全检查
@@ -270,6 +274,7 @@ async function agentLoop(messages) {
     // 消费后台任务通知队列，注入为用户消息
     const notifs = BG.drainNotifications();
     if (notifs.length > 0 && messages.length > 0) {
+      flow.infra("后台通知注入", { count: notifs.length, notifs });
       const notifText = notifs
         .map((n) => `[后台:${n.task_id}] ${n.status}: ${n.result}`)
         .join("\n");
@@ -280,6 +285,7 @@ async function agentLoop(messages) {
       });
     }
 
+    flow.llmRequest(messages.length, SYSTEM);
     const response = await client.messages.create({
       model: MODEL,
       system: SYSTEM,
@@ -287,6 +293,7 @@ async function agentLoop(messages) {
       tools: TOOLS,
       max_tokens: 8000,
     });
+    flow.llmResponse(response);
 
     messages.push({ role: "assistant", content: response.content });
 
@@ -302,8 +309,10 @@ async function agentLoop(messages) {
         } catch (e) {
           output = `错误：${e.message}`;
         }
-        console.log(`> ${block.name}:`);
-        console.log(String(output).slice(0, 200));
+        if (block.name === "bash_background") {
+          flow.infra("bash_background 调用", block.input);
+        }
+        flow.toolUse(block, output);
         results.push({ type: "tool_result", tool_use_id: block.id, content: String(output) });
       }
     }
@@ -322,11 +331,12 @@ function prompt() {
       return;
     }
     history.push({ role: "user", content: query });
+    flow.userTurn(query);
     await agentLoop(history);
     const last = history[history.length - 1].content;
     if (Array.isArray(last)) {
       for (const block of last) {
-        if (block.text) console.log(block.text);
+        if (block.text) console.log(`LLM 回复：${block.text}`);
       }
     }
     console.log();

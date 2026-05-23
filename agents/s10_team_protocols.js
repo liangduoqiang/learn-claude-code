@@ -48,24 +48,20 @@
 //   s09：队员单向接收任务，做完就停
 //   s10：双向协议，队员可以主动提交计划，Lead 可以优雅关闭队员
 
-import Anthropic from "@anthropic-ai/sdk";
+import { createLlmClient, getModel } from "./llm_client.js";
+import { createFlowContext, flowOnce } from "./exec_flow.js";
 import { execSync } from "child_process";
 import * as readline from "readline";
 import * as dotenv from "dotenv";
 import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
-import * as process from "process";
 
 dotenv.config({ override: true });
 
-if (process.env.ANTHROPIC_BASE_URL) {
-  delete process.env.ANTHROPIC_AUTH_TOKEN;
-}
-
 const WORKDIR = process.cwd();
-const client = new Anthropic({ baseURL: process.env.ANTHROPIC_BASE_URL });
-const MODEL = process.env.MODEL_ID;
+const client = createLlmClient();
+const MODEL = getModel();
 const TEAM_DIR = path.join(WORKDIR, ".team");
 const INBOX_DIR = path.join(TEAM_DIR, "inbox");
 
@@ -111,6 +107,7 @@ class MessageBus {
     };
     const inboxPath = path.join(this.dir, `${to}.jsonl`);
     fs.appendFileSync(inboxPath, JSON.stringify(msg) + "\n");
+    flowOnce("s10", "收件箱写入", { path: inboxPath, msg });
     return `已发送 ${msgType} 给 ${to}`;
   }
 
@@ -120,7 +117,11 @@ class MessageBus {
     const text = fs.readFileSync(inboxPath, "utf8").trim();
     fs.writeFileSync(inboxPath, "");
     if (!text) return [];
-    return text.split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    const messages = text.split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    if (messages.length) {
+      flowOnce("s10", "收件箱消费", { name, count: messages.length, messages });
+    }
+    return messages;
   }
 
   broadcast(sender, content, teammates) {
@@ -183,12 +184,14 @@ class TeammateManager {
     this._saveConfig();
     // 注意：这里直接用 async 函数而不是 Worker 线程
     // 优点：代码简单；缺点：在同一个 Node.js 事件循环中，可能阻塞主线程
+    flowOnce("s10", "队员异步循环启动", { name, role, prompt: prompt.slice(0, 120) });
     this._teammateLoop(name, role, prompt).catch(() => {});
     return `已派生 '${name}'（角色：${role}）`;
   }
 
   // 队员 Agent 循环（在主线程的事件循环中异步运行）
   async _teammateLoop(name, role, prompt) {
+    const mateFlow = createFlowContext(`s10:teammate:${name}`);
     const sysPrompt =
       `你是 '${name}'，角色：${role}，工作在 ${WORKDIR}。` +
       `在进行重要工作前，通过 plan_approval 提交计划。` +
@@ -205,6 +208,7 @@ class TeammateManager {
       }
       if (shouldExit) break;
 
+      mateFlow.llmRequest(messages.length, sysPrompt);
       let response;
       try {
         response = await client.messages.create({
@@ -217,6 +221,7 @@ class TeammateManager {
       } catch {
         break;
       }
+      mateFlow.llmResponse(response);
 
       messages.push({ role: "assistant", content: response.content });
       if (response.stop_reason !== "tool_use") break;
@@ -225,7 +230,7 @@ class TeammateManager {
       for (const block of response.content) {
         if (block.type === "tool_use") {
           const output = this._exec(name, block.name, block.input);
-          console.log(`  [${name}] ${block.name}: ${String(output).slice(0, 120)}`);
+          mateFlow.toolUse(block, output, { actor: name });
           results.push({
             type: "tool_result",
             tool_use_id: block.id,
@@ -245,6 +250,7 @@ class TeammateManager {
     if (member) {
       member.status = shouldExit ? "shutdown" : "idle";
       this._saveConfig();
+      mateFlow.phase("队员循环结束", { status: member.status });
     }
   }
 
@@ -270,6 +276,7 @@ class TeammateManager {
         const approve = args.approve;
         if (reqId in shutdownRequests) {
           shutdownRequests[reqId].status = approve ? "approved" : "rejected";
+          flowOnce("s10", "关闭协议 FSM", { event: "shutdown_response", reqId, approve });
         }
         BUS.send(sender, "lead", args.reason || "", "shutdown_response", {
           request_id: reqId,
@@ -283,6 +290,7 @@ class TeammateManager {
         const planText = args.plan || "";
         const reqId = crypto.randomUUID().slice(0, 8);
         planRequests[reqId] = { from: sender, plan: planText, status: "pending" };
+        flowOnce("s10", "计划审批 FSM", { event: "plan_submitted", reqId, from: sender });
         BUS.send(sender, "lead", planText, "plan_approval_response", {
           request_id: reqId,
           plan: planText,
@@ -356,6 +364,7 @@ class TeammateManager {
 }
 
 const TEAM = new TeammateManager(TEAM_DIR);
+const flow = createFlowContext("s10:lead");
 
 // 基础工具实现
 function safePath(p) {
@@ -431,6 +440,7 @@ function runEdit(p, oldText, newText) {
 function handleShutdownRequest(teammate) {
   const reqId = crypto.randomUUID().slice(0, 8);
   shutdownRequests[reqId] = { target: teammate, status: "pending" };
+  flow.infra("关闭协议 FSM", { event: "shutdown_request", reqId, teammate });
   BUS.send("lead", teammate, "请优雅关闭。", "shutdown_request", {
     request_id: reqId,
   });
@@ -442,6 +452,7 @@ function handlePlanReview(requestId, approve, feedback = "") {
   const req = planRequests[requestId];
   if (!req) return `错误：未知计划 request_id '${requestId}'`;
   req.status = approve ? "approved" : "rejected";
+  flow.infra("计划审批 FSM", { requestId, approve, from: req.from, status: req.status });
   BUS.send("lead", req.from, feedback, "plan_approval_response", {
     request_id: requestId,
     approve,
@@ -538,12 +549,14 @@ async function agentLoop(messages) {
   while (true) {
     const inbox = BUS.readInbox("lead");
     if (inbox.length > 0) {
+      flow.infra("Lead 收件箱注入对话", { count: inbox.length });
       messages.push({
         role: "user",
         content: `<inbox>${JSON.stringify(inbox, null, 2)}</inbox>`,
       });
     }
 
+    flow.llmRequest(messages.length, SYSTEM);
     const response = await client.messages.create({
       model: MODEL,
       system: SYSTEM,
@@ -551,6 +564,7 @@ async function agentLoop(messages) {
       tools: TOOLS,
       max_tokens: 8000,
     });
+    flow.llmResponse(response);
 
     messages.push({ role: "assistant", content: response.content });
     if (response.stop_reason !== "tool_use") return;
@@ -565,8 +579,14 @@ async function agentLoop(messages) {
         } catch (e) {
           output = `错误：${e.message}`;
         }
-        console.log(`> ${block.name}:`);
-        console.log(String(output).slice(0, 200));
+        if (
+          ["spawn_teammate", "shutdown_request", "plan_approval", "send_message"].includes(
+            block.name
+          )
+        ) {
+          flow.infra(`Lead 协议/团队 ${block.name}`, block.input);
+        }
+        flow.toolUse(block, output, { actor: "lead" });
         results.push({
           type: "tool_result",
           tool_use_id: block.id,
@@ -602,21 +622,22 @@ async function main() {
     if (!query || ["q", "exit"].includes(query.trim().toLowerCase())) break;
 
     if (query.trim() === "/team") {
-      console.log(TEAM.listAll());
+      console.log(`团队状态：\n${TEAM.listAll()}`);
       continue;
     }
     if (query.trim() === "/inbox") {
-      console.log(JSON.stringify(BUS.readInbox("lead"), null, 2));
+      console.log(`主线程收件箱：\n${JSON.stringify(BUS.readInbox("lead"), null, 2)}`);
       continue;
     }
 
     history.push({ role: "user", content: query });
+    flow.userTurn(query);
     await agentLoop(history);
 
     const last = history[history.length - 1];
     if (Array.isArray(last.content)) {
       for (const block of last.content) {
-        if (block.type === "text") process.stdout.write(block.text);
+        if (block.type === "text") process.stdout.write(`LLM 回复：${block.text}`);
       }
     }
     console.log();
@@ -626,6 +647,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(err);
+  console.error("程序异常：", err);
   process.exit(1);
 });

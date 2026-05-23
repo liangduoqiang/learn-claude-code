@@ -24,23 +24,21 @@
 //             不会污染父 Agent 的对话历史。
 //             这就像"派一个人去调研，回来给你汇报"，而不是"把整个调研过程塞给你"。
 
-import Anthropic from "@anthropic-ai/sdk";
+import { createLlmClient, getModel } from "./llm_client.js";
+import { createFlowContext } from "./exec_flow.js";
 import { execSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import * as readline from "readline";
 import * as dotenv from "dotenv";
-import * as process from "process";
 
 dotenv.config({ override: true });
 
-if (process.env.ANTHROPIC_BASE_URL) {
-  delete process.env.ANTHROPIC_AUTH_TOKEN;
-}
-
 const WORKDIR = process.cwd();
-const client = new Anthropic({ baseURL: process.env.ANTHROPIC_BASE_URL });
-const MODEL = process.env.MODEL_ID;
+const client = createLlmClient();
+const MODEL = getModel();
+const flow = createFlowContext("s04");
+const subFlow = createFlowContext("s04:subagent");
 
 // 父 Agent 提示：鼓励使用 task 工具委托子任务
 const SYSTEM = `你是一个工作在 ${WORKDIR} 目录的编程智能体。使用 task 工具委托探索或子任务。`;
@@ -187,10 +185,12 @@ const CHILD_TOOLS = [
 // 4. 轮数上限：最多 30 轮，防止子 Agent 陷入死循环
 // =====================================================================
 async function runSubagent(prompt) {
+  flow.phase("子代理创建", { promptPreview: prompt.slice(0, 120) });
   const subMessages = [{ role: "user", content: prompt }];  // 全新上下文！
   let response;
 
   for (let i = 0; i < 30; i++) {  // 最多 30 轮防止死循环
+    subFlow.llmRequest(subMessages.length, SUBAGENT_SYSTEM);
     response = await client.messages.create({
       model: MODEL,
       system: SUBAGENT_SYSTEM,
@@ -198,6 +198,7 @@ async function runSubagent(prompt) {
       tools: CHILD_TOOLS,     // 子 Agent 只有基础工具
       max_tokens: 8000,
     });
+    subFlow.llmResponse(response);
     subMessages.push({ role: "assistant", content: response.content });
     if (response.stop_reason !== "tool_use") break;  // 子 Agent 完成了
 
@@ -206,6 +207,7 @@ async function runSubagent(prompt) {
       if (block.type === "tool_use") {
         const handler = TOOL_HANDLERS[block.name];
         const output = handler ? handler(block.input) : `未知工具：${block.name}`;
+        subFlow.toolUse(block, output, { actor: "subagent" });
         results.push({
           type: "tool_result",
           tool_use_id: block.id,
@@ -222,6 +224,7 @@ async function runSubagent(prompt) {
     .filter((b) => b.type === "text")
     .map((b) => b.text)
     .join("");
+  flow.phase("子代理销毁", { summaryPreview: (summary || "(无摘要)").slice(0, 200) });
   return summary || "(无摘要)";
 }
 
@@ -249,6 +252,7 @@ const PARENT_TOOLS = [
 // 父 Agent 循环：遇到 task 工具时异步派发子 Agent
 async function agentLoop(messages) {
   while (true) {
+    flow.llmRequest(messages.length, SYSTEM);
     const response = await client.messages.create({
       model: MODEL,
       system: SYSTEM,
@@ -256,6 +260,7 @@ async function agentLoop(messages) {
       tools: PARENT_TOOLS,
       max_tokens: 8000,
     });
+    flow.llmResponse(response);
     messages.push({ role: "assistant", content: response.content });
     if (response.stop_reason !== "tool_use") return;
 
@@ -267,13 +272,14 @@ async function agentLoop(messages) {
           // 收到 task 工具调用 → 创建子 Agent 处理
           const desc = block.input.description || "子任务";
           const prompt = block.input.prompt || "";
-          console.log(`> task (${desc}): ${prompt.slice(0, 80)}`);
+          flow.infra("task 派发", { description: desc, prompt: prompt.slice(0, 200) });
           output = await runSubagent(prompt);  // 子 Agent 完整执行，只返回摘要
+          flow.toolUse(block, output, { actor: "parent" });
         } else {
           const handler = TOOL_HANDLERS[block.name];
           output = handler ? handler(block.input) : `未知工具：${block.name}`;
+          flow.toolUse(block, output, { actor: "parent" });
         }
-        console.log(`  ${String(output).slice(0, 200)}`);
         results.push({
           type: "tool_result",
           tool_use_id: block.id,
@@ -309,12 +315,13 @@ async function main() {
     if (!query || ["q", "exit"].includes(query.trim().toLowerCase())) break;
 
     history.push({ role: "user", content: query });
+    flow.userTurn(query);
     await agentLoop(history);
 
     const last = history[history.length - 1];
     if (Array.isArray(last.content)) {
       for (const block of last.content) {
-        if (block.type === "text") process.stdout.write(block.text);
+        if (block.type === "text") process.stdout.write(`LLM 回复：${block.text}`);
       }
     }
     console.log();
@@ -324,6 +331,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(err);
+  console.error("程序异常：", err);
   process.exit(1);
 });

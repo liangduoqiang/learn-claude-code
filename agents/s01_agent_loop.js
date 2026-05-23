@@ -21,26 +21,20 @@
 // 【核心理念】整个 Agent 不过就是一个"发请求 → 执行工具 → 把结果喂回去"的循环。
 //             只要 LLM 还在请求工具，循环就继续；LLM 停止请求工具时，循环结束。
 
-import Anthropic from "@anthropic-ai/sdk";
+import { createLlmClient, getModel } from "./llm_client.js";
+import { createFlowContext } from "./exec_flow.js";
 import { execSync } from "child_process";
 import * as readline from "readline";
 import * as dotenv from "dotenv";
 import * as os from "os";
-import * as process from "process";
 
 // 加载 .env 文件中的环境变量
 dotenv.config({ override: true });
 
-// 如果使用了自定义 Base URL（例如代理），则清除可能冲突的 token
-if (process.env.ANTHROPIC_BASE_URL) {
-  delete process.env.ANTHROPIC_AUTH_TOKEN;
-}
-
-// 初始化 Anthropic 客户端（API 调用入口）
-const client = new Anthropic({
-  baseURL: process.env.ANTHROPIC_BASE_URL,
-});
-const MODEL = process.env.MODEL_ID;
+// OpenAI 兼容 Chat Completions 客户端（见 llm_client.js）
+const client = createLlmClient();
+const MODEL = getModel();
+const flow = createFlowContext("s01");
 
 // 系统提示词：告诉 LLM 它的身份和行为准则
 // "Act, don't explain" → 要求 LLM 直接行动，不要废话
@@ -93,6 +87,7 @@ function runBash(command) {
 // =====================================================================
 async function agentLoop(messages) {
   while (true) {
+    flow.llmRequest(messages.length, SYSTEM);
     // 1. 调用 LLM，传入完整的对话历史和工具列表
     const response = await client.messages.create({
       model: MODEL,
@@ -101,6 +96,7 @@ async function agentLoop(messages) {
       tools: TOOLS,
       max_tokens: 8000,
     });
+    flow.llmResponse(response);
 
     // 2. 将 LLM 的回复追加到消息历史（无论是文本还是工具调用）
     messages.push({ role: "assistant", content: response.content });
@@ -115,10 +111,8 @@ async function agentLoop(messages) {
     const results = [];
     for (const block of response.content) {
       if (block.type === "tool_use") {
-        // 打印正在执行的命令（黄色高亮）
-        console.log(`\x1b[33m$ ${block.input.command}\x1b[0m`);
         const output = runBash(block.input.command);
-        console.log(output.slice(0, 200));
+        flow.toolUse(block, output);
 
         // 构造工具结果，必须包含 tool_use_id 让 LLM 对应上
         results.push({
@@ -166,6 +160,7 @@ async function main() {
 
     // 用户输入追加到历史
     history.push({ role: "user", content: query });
+    flow.userTurn(query);
 
     // 启动 Agent 循环，处理这个任务（可能调用多轮工具）
     await agentLoop(history);
@@ -176,17 +171,17 @@ async function main() {
     if (Array.isArray(responseContent)) {
       for (const block of responseContent) {
         if (block.type === "text") {
-          process.stdout.write(block.text);
+          process.stdout.write(`LLM 回复：${block.text}`);
         }
       }
     }
-    console.log();
+    console.log("\n");
   }
 
   rl.close();
 }
 
 main().catch((err) => {
-  console.error(err);
+  console.error("程序异常：", err);
   process.exit(1);
 });

@@ -34,23 +34,20 @@
 //             只有模型真正需要某个技能时，才把技能内容注入上下文。
 //             这节省了大量 token，也让系统提示词保持简洁。
 
-import Anthropic from "@anthropic-ai/sdk";
+import { createLlmClient, getModel } from "./llm_client.js";
+import { createFlowContext } from "./exec_flow.js";
 import { execSync } from "child_process";
 import * as readline from "readline";
 import * as dotenv from "dotenv";
 import * as fs from "fs";
 import * as path from "path";
-import * as process from "process";
 
 dotenv.config({ override: true });
 
-if (process.env.ANTHROPIC_BASE_URL) {
-  delete process.env.ANTHROPIC_AUTH_TOKEN;
-}
-
 const WORKDIR = process.cwd();
-const client = new Anthropic({ baseURL: process.env.ANTHROPIC_BASE_URL });
-const MODEL = process.env.MODEL_ID;
+const client = createLlmClient();
+const MODEL = getModel();
+const flow = createFlowContext("s05");
 const SKILLS_DIR = path.join(WORKDIR, "skills");
 
 
@@ -285,6 +282,7 @@ const TOOLS = [
 
 async function agentLoop(messages) {
   while (true) {
+    flow.llmRequest(messages.length, SYSTEM);
     const response = await client.messages.create({
       model: MODEL,
       system: SYSTEM,
@@ -292,6 +290,7 @@ async function agentLoop(messages) {
       tools: TOOLS,
       max_tokens: 8000,
     });
+    flow.llmResponse(response);
 
     messages.push({ role: "assistant", content: response.content });
 
@@ -307,8 +306,10 @@ async function agentLoop(messages) {
         } catch (e) {
           output = `错误：${e.message}`;
         }
-        console.log(`> ${block.name}:`);
-        console.log(String(output).slice(0, 200));
+        if (block.name === "load_skill") {
+          flow.infra("技能按需加载", { name: block.input?.name });
+        }
+        flow.toolUse(block, output);
         results.push({
           type: "tool_result",
           tool_use_id: block.id,
@@ -344,12 +345,13 @@ async function main() {
     if (!query || ["q", "exit"].includes(query.trim().toLowerCase())) break;
 
     history.push({ role: "user", content: query });
+    flow.userTurn(query);
     await agentLoop(history);
 
     const last = history[history.length - 1];
     if (Array.isArray(last.content)) {
       for (const block of last.content) {
-        if (block.type === "text") process.stdout.write(block.text);
+        if (block.type === "text") process.stdout.write(`LLM 回复：${block.text}`);
       }
     }
     console.log();
@@ -359,6 +361,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(err);
+  console.error("程序异常：", err);
   process.exit(1);
 });

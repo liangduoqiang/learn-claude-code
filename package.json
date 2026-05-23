@@ -1,0 +1,9 @@
+{
+  "name": "learn-claude-code",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "openai": "^4.104.0"
+  }
+}

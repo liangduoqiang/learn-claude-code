@@ -22,7 +22,8 @@
 //             即使上下文被压缩清空，任务状态依然存在。
 //             这解决了 LLM 上下文压缩时丢失任务状态的问题。
 
-import Anthropic from "@anthropic-ai/sdk";
+import { createLlmClient, getModel } from "./llm_client.js";
+import { createFlowContext } from "./exec_flow.js";
 import { execSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
@@ -31,14 +32,11 @@ import * as dotenv from "dotenv";
 
 dotenv.config({ override: true });
 
-if (process.env.ANTHROPIC_BASE_URL) {
-  delete process.env.ANTHROPIC_AUTH_TOKEN;
-}
-
 const WORKDIR = process.cwd();
-const client = new Anthropic({ baseURL: process.env.ANTHROPIC_BASE_URL });
-const MODEL = process.env.MODEL_ID;
+const client = createLlmClient();
+const MODEL = getModel();
 const TASKS_DIR = path.join(WORKDIR, ".tasks");
+const flow = createFlowContext("s07");
 
 const SYSTEM = `你是一个工作在 ${WORKDIR} 目录的编程智能体。使用任务工具规划和追踪工作。`;
 
@@ -322,6 +320,7 @@ const TOOLS = [
 
 async function agentLoop(messages) {
   while (true) {
+    flow.llmRequest(messages.length, SYSTEM);
     const response = await client.messages.create({
       model: MODEL,
       system: SYSTEM,
@@ -329,6 +328,7 @@ async function agentLoop(messages) {
       tools: TOOLS,
       max_tokens: 8000,
     });
+    flow.llmResponse(response);
 
     messages.push({ role: "assistant", content: response.content });
 
@@ -344,8 +344,10 @@ async function agentLoop(messages) {
         } catch (e) {
           output = `错误：${e.message}`;
         }
-        console.log(`> ${block.name}:`);
-        console.log(String(output).slice(0, 200));
+        if (block.name.startsWith("task_")) {
+          flow.infra("任务系统", { tool: block.name, input: block.input });
+        }
+        flow.toolUse(block, output);
         results.push({ type: "tool_result", tool_use_id: block.id, content: String(output) });
       }
     }
@@ -365,11 +367,12 @@ function prompt() {
       return;
     }
     history.push({ role: "user", content: query });
+    flow.userTurn(query);
     await agentLoop(history);
     const last = history[history.length - 1].content;
     if (Array.isArray(last)) {
       for (const block of last) {
-        if (block.text) console.log(block.text);
+        if (block.text) console.log(`LLM 回复：${block.text}`);
       }
     }
     console.log();

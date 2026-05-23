@@ -47,21 +47,18 @@
 //   - Worker 线程（本文件）：共享内存，持久存在，可以接收新消息
 //   - Worker 线程更适合持久化协作，因为可以保持状态并持续工作
 
-import Anthropic from "@anthropic-ai/sdk";
+import { createLlmClient, getModel } from "./llm_client.js";
+import { createFlowContext, flowOnce } from "./exec_flow.js";
 import { spawnSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import * as readline from "readline";
 import * as dotenv from "dotenv";
-import * as process from "process";
+// import * as process from "process";
 import { Worker, isMainThread, workerData, parentPort } from "worker_threads";
 import { fileURLToPath } from "url";
 
 dotenv.config({ override: true });
-
-if (process.env.ANTHROPIC_BASE_URL) {
-  delete process.env.ANTHROPIC_AUTH_TOKEN;
-}
 
 // 获取当前文件路径（Worker 需要用文件路径来加载自身）
 const __filename = fileURLToPath(import.meta.url);
@@ -69,7 +66,7 @@ const __filename = fileURLToPath(import.meta.url);
 const WORKDIR = process.cwd();
 const TEAM_DIR = path.join(WORKDIR, ".team");
 const INBOX_DIR = path.join(TEAM_DIR, "inbox");
-const MODEL = process.env.MODEL_ID;
+const MODEL = getModel();
 
 // 合法的消息类型枚举（防止乱写类型）
 const VALID_MSG_TYPES = new Set([
@@ -115,6 +112,7 @@ class MessageBus {
     const inboxPath = path.join(this.dir, `${to}.jsonl`);
     // 追加一行 JSON（每条消息一行）
     fs.appendFileSync(inboxPath, JSON.stringify(msg) + "\n");
+    flowOnce("s09", "收件箱写入", { path: inboxPath, msg });
     return `已发送 ${msgType} 给 ${to}`;
   }
 
@@ -127,6 +125,9 @@ class MessageBus {
       ? text.split("\n").filter(Boolean).map((l) => JSON.parse(l))
       : [];
     fs.writeFileSync(inboxPath, "");  // 读后清空（消费模式）
+    if (messages.length) {
+      flowOnce("s09", "收件箱消费", { name, count: messages.length, messages });
+    }
     return messages;
   }
 
@@ -205,15 +206,17 @@ class TeammateManager {
         workdir: WORKDIR,
         inboxDir: INBOX_DIR,
         model: MODEL,
-        baseUrl: process.env.ANTHROPIC_BASE_URL || null,
-        apiKey: process.env.ANTHROPIC_API_KEY || null,
+        baseUrl: process.env.OPENAI_BASE_URL || null,
+        apiKey: process.env.OPENAI_API_KEY || null,
       },
     });
     this.workers[name] = worker;
+    flowOnce("s09", "Worker 线程创建", { name, role, threadId: worker.threadId });
 
     // 监听 Worker 的消息（当前只处理 "done" 消息）
     worker.on("message", (msg) => {
       if (msg.type === "done") {
+        flowOnce("s09", "Worker 线程完成", { name });
         const m = this._findMember(name);
         if (m && m.status !== "shutdown") {
           m.status = "idle";  // Worker 完成工作 → 标记为空闲
@@ -222,7 +225,7 @@ class TeammateManager {
       }
     });
     worker.on("error", (err) => {
-      console.error(`[${name}] Worker 错误：`, err.message);
+      console.error(`队友 [${name}] 运行错误：`, err.message);
     });
 
     return `已派生 '${name}'（角色：${role}）`;
@@ -317,7 +320,7 @@ function runEdit(filePath, oldText, newText, workdir) {
 //
 // Worker 线程执行路径：
 // 1. 读取 workerData 获取配置（name, role, prompt 等）
-// 2. 创建自己的 Anthropic 客户端和 MessageBus
+// 2. 创建自己的 LLM 客户端和 MessageBus
 // 3. 进入 Agent 循环：
 //    a. 读取收件箱（有消息则注入对话）
 //    b. 调用 LLM
@@ -327,12 +330,10 @@ function runEdit(filePath, oldText, newText, workdir) {
 // =====================================================================
 async function runTeammateLoop() {
   const { name, role, prompt, workdir, inboxDir, model, baseUrl, apiKey } = workerData;
+  const mateFlow = createFlowContext(`s09:worker:${name}`);
+  mateFlow.phase("队员循环启动", { role, prompt: prompt.slice(0, 120) });
 
-  // Worker 线程创建自己的 Anthropic 客户端
-  const clientOpts = {};
-  if (baseUrl) clientOpts.baseURL = baseUrl;
-  if (apiKey) clientOpts.apiKey = apiKey;
-  const client = new Anthropic(clientOpts);
+  const client = createLlmClient({ baseUrl, apiKey });
 
   const bus = new MessageBus(inboxDir);
 
@@ -426,6 +427,7 @@ async function runTeammateLoop() {
       messages.push({ role: "user", content: JSON.stringify(msg) });
     }
 
+    mateFlow.llmRequest(messages.length, sysPrompt);
     let response;
     try {
       response = await client.messages.create({
@@ -438,6 +440,7 @@ async function runTeammateLoop() {
     } catch {
       break;  // API 调用失败时退出
     }
+    mateFlow.llmResponse(response);
 
     messages.push({ role: "assistant", content: response.content });
 
@@ -447,7 +450,7 @@ async function runTeammateLoop() {
     for (const block of response.content) {
       if (block.type === "tool_use") {
         const output = execTeammateTool(block.name, block.input);
-        console.log(`  [${name}] ${block.name}: ${String(output).slice(0, 120)}`);
+        mateFlow.toolUse(block, output, { actor: name });
         results.push({
           type: "tool_result",
           tool_use_id: block.id,
@@ -470,15 +473,16 @@ async function runTeammateLoop() {
 if (!isMainThread) {
   // Worker 线程路径
   if (workerData?.isTeammate) {
-    runTeammateLoop().catch(console.error);
+    runTeammateLoop().catch((err) => console.error("队友循环异常：", err));
   }
 } else {
   // 主线程路径（Lead Agent）
   const SYSTEM = `你是工作在 ${WORKDIR} 的团队 Lead。派生队员并通过收件箱进行通信。`;
 
-  const client = new Anthropic({ baseURL: process.env.ANTHROPIC_BASE_URL });
+  const client = createLlmClient();
   const BUS = new MessageBus(INBOX_DIR);
   const TEAM = new TeammateManager(TEAM_DIR);
+  const flow = createFlowContext("s09:lead");
 
   // Lead Agent 工具派发表（9 个工具：基础 4 + 团队管理 5）
   const TOOL_HANDLERS = {
@@ -587,12 +591,14 @@ if (!isMainThread) {
       // 读取 lead 的收件箱（来自队员的消息）
       const inbox = BUS.readInbox("lead");
       if (inbox.length) {
+        flow.infra("Lead 收件箱注入对话", { count: inbox.length });
         messages.push({
           role: "user",
           content: `<inbox>${JSON.stringify(inbox, null, 2)}</inbox>`,
         });
       }
 
+      flow.llmRequest(messages.length, SYSTEM);
       const response = await client.messages.create({
         model: MODEL,
         system: SYSTEM,
@@ -600,6 +606,7 @@ if (!isMainThread) {
         tools: TOOLS,
         max_tokens: 8000,
       });
+      flow.llmResponse(response);
 
       messages.push({ role: "assistant", content: response.content });
 
@@ -615,8 +622,10 @@ if (!isMainThread) {
           } catch (e) {
             output = `错误：${e.message}`;
           }
-          console.log(`> ${block.name}:`);
-          console.log(String(output).slice(0, 200));
+          if (["spawn_teammate", "send_message", "broadcast", "read_inbox"].includes(block.name)) {
+            flow.infra(`Lead 团队工具 ${block.name}`, block.input);
+          }
+          flow.toolUse(block, output, { actor: "lead" });
           results.push({
             type: "tool_result",
             tool_use_id: block.id,
@@ -640,16 +649,20 @@ if (!isMainThread) {
       }
       // 调试命令：直接查看团队状态和收件箱
       if (query.trim() === "/team") {
-        console.log(TEAM.listAll());
+        flow.infra("调试 /team", { roster: TEAM.listAll() });
+        console.log(`团队状态：\n${TEAM.listAll()}`);
       } else if (query.trim() === "/inbox") {
-        console.log(JSON.stringify(BUS.readInbox("lead"), null, 2));
+        const inbox = BUS.readInbox("lead");
+        flow.infra("调试 /inbox", { inbox });
+        console.log(`主线程收件箱：\n${JSON.stringify(inbox, null, 2)}`);
       } else {
         history.push({ role: "user", content: query });
+        flow.userTurn(query);
         await agentLoop(history);
         const last = history[history.length - 1];
         if (Array.isArray(last.content)) {
           for (const block of last.content) {
-            if (block.type === "text") console.log(block.text);
+            if (block.type === "text") console.log(`LLM 回复：${block.text}`);
           }
         }
         console.log();

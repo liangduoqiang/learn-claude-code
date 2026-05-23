@@ -31,7 +31,7 @@
 //
 //     REPL commands: /compact /tasks /team /inbox
 
-import Anthropic from "@anthropic-ai/sdk";
+import { createLlmClient, getModel } from "./llm_client.js";
 import * as dotenv from "dotenv";
 import { execSync, exec } from "child_process";
 import fs from "fs";
@@ -40,13 +40,9 @@ import crypto from "crypto";
 import * as readline from "readline";
 
 dotenv.config({ override: true });
-if (process.env.ANTHROPIC_BASE_URL) {
-  delete process.env.ANTHROPIC_AUTH_TOKEN;
-}
-
 const WORKDIR = process.cwd();
-const client = new Anthropic({ baseURL: process.env.ANTHROPIC_BASE_URL });
-const MODEL = process.env.MODEL_ID;
+const client = createLlmClient();
+const MODEL = getModel();
 
 const TEAM_DIR = path.join(WORKDIR, ".team");
 const INBOX_DIR = path.join(TEAM_DIR, "inbox");

@@ -17,23 +17,20 @@
 // 【核心理念】循环根本没有改变。我只是增加了工具而已。
 //             工具越多，Agent 能力越强；派发表让代码保持整洁。
 
-import Anthropic from "@anthropic-ai/sdk";
+import { createLlmClient, getModel } from "./llm_client.js";
+import { createFlowContext } from "./exec_flow.js";
 import { execSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import * as readline from "readline";
 import * as dotenv from "dotenv";
-import * as process from "process";
 
 dotenv.config({ override: true });
 
-if (process.env.ANTHROPIC_BASE_URL) {
-  delete process.env.ANTHROPIC_AUTH_TOKEN;
-}
-
 const WORKDIR = process.cwd();
-const client = new Anthropic({ baseURL: process.env.ANTHROPIC_BASE_URL });
-const MODEL = process.env.MODEL_ID;
+const client = createLlmClient();
+const MODEL = getModel();
+const flow = createFlowContext("s02");
 
 const SYSTEM = `你是一个工作在 ${WORKDIR} 目录的编程智能体。使用工具完成任务。直接行动，不要解释。`;
 
@@ -182,6 +179,7 @@ const TOOLS = [
 // Agent 循环（与 s01 完全相同，只是使用了派发表来路由工具）
 async function agentLoop(messages) {
   while (true) {
+    flow.llmRequest(messages.length, SYSTEM);
     const response = await client.messages.create({
       model: MODEL,
       system: SYSTEM,
@@ -189,6 +187,7 @@ async function agentLoop(messages) {
       tools: TOOLS,
       max_tokens: 8000,
     });
+    flow.llmResponse(response);
 
     messages.push({ role: "assistant", content: response.content });
 
@@ -204,8 +203,7 @@ async function agentLoop(messages) {
         const output = handler
           ? handler(block.input)
           : `未知工具：${block.name}`;   // 未知工具时返回错误信息而非抛出异常
-        console.log(`\x1b[33m> ${block.name}:\x1b[0m`);
-        console.log(output.slice(0, 200));
+        flow.toolUse(block, output);
         results.push({
           type: "tool_result",
           tool_use_id: block.id,
@@ -243,6 +241,7 @@ async function main() {
     }
 
     history.push({ role: "user", content: query });
+    flow.userTurn(query);
     await agentLoop(history);
 
     const last = history[history.length - 1];
@@ -250,7 +249,7 @@ async function main() {
     if (Array.isArray(responseContent)) {
       for (const block of responseContent) {
         if (block.type === "text") {
-          process.stdout.write(block.text);
+          process.stdout.write(`LLM 回复：${block.text}`);
         }
       }
     }
@@ -261,6 +260,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(err);
+  console.error("程序异常：", err);
   process.exit(1);
 });

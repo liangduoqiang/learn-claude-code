@@ -301,6 +301,25 @@ learn-claude-code/
 Mental-model-first: problem, solution, ASCII diagram, minimal code.
 Available in [English](./docs/en/) | [中文](./docs/zh/) | [日本語](./docs/ja/).
 
+### agents/ 目录学习要点
+
+`agents/` 目录包含 `s01` ~ `s12` 共 12 个渐进式示例文件，完整覆盖了 AI Agent 的核心实现技术。每个文件新增一个机制，层层递进：
+
+- **s01 Agent 循环**：`while(tool_use)` 循环是 Agent 的核心。模型决定何时调用工具，代码只负责执行。
+- **s02 工具扩展**：通过 `TOOL_HANDLERS` 派发表新增工具，无需修改循环本身。包含安全路径检查。
+- **s03 待办追踪**：`TodoManager` 状态机 + 催促提醒注入机制，引导 LLM 更新进度。
+- **s04 子智能体**：进程隔离 = 上下文隔离。子 Agent 用全新 `messages` 运行，只返回最终摘要。
+- **s05 技能加载**：两层注入架构（系统提示词列名称 + 按需注入完整内容），节省 token。
+- **s06 上下文压缩**：三层压缩流水线（micro → auto → model-triggered），实现无限运行。
+- **s07 持久化任务**：任务状态存储在文件系统，支持依赖关系和自动解除阻塞。
+- **s08 后台任务**：`exec()` 非阻塞执行 + 通知队列，实现并行异步操作。
+- **s09 Agent 团队**：Worker 线程 + JSONL 收件箱，持久化协作通信。
+- **s10 团队协议**：`request_id` 关联模式，实现关闭审批和计划审批 FSM。
+- **s11 自主智能体**：空闲轮询 + 自动认领 + 身份重注入，Agent 自主寻工。
+- **s12 工作树隔离**：`git worktree` 实现目录级并行，控制平面与执行平面分离。
+
+完整学习指南见 [agents/LEARNING_GUIDE.md](./agents/LEARNING_GUIDE.md)。
+
 | Session | Topic | Motto |
 |---------|-------|-------|
 | [s01](./docs/en/s01-the-agent-loop.md) | The Agent Loop | *One loop & Bash is all you need* |

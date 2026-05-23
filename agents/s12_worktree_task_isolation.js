@@ -39,23 +39,20 @@
 //   create → active → [work] → keep（保留分支）或 remove（删除分支）
 //   remove 时可选 complete_task=true 自动将关联任务标记为完成
 
-import Anthropic from "@anthropic-ai/sdk";
+import { createLlmClient, getModel } from "./llm_client.js";
+import { createFlowContext, flowOnce } from "./exec_flow.js";
 import { execSync, spawnSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import * as readline from "readline";
 import * as dotenv from "dotenv";
-import * as process from "process";
 
 dotenv.config({ override: true });
 
-if (process.env.ANTHROPIC_BASE_URL) {
-  delete process.env.ANTHROPIC_AUTH_TOKEN;
-}
-
 const WORKDIR = process.cwd();
-const client = new Anthropic({ baseURL: process.env.ANTHROPIC_BASE_URL });
-const MODEL = process.env.MODEL_ID;
+const client = createLlmClient();
+const MODEL = getModel();
+const flow = createFlowContext("s12");
 
 // 自动检测 git 仓库根目录
 function detectRepoRoot(cwd) {
@@ -108,6 +105,7 @@ class EventBus {
     };
     if (error) payload.error = error;
     fs.appendFileSync(this.path, JSON.stringify(payload) + "\n", "utf8");
+    flowOnce("s12", "EventBus", payload);
   }
 
   // 读取最近的 N 条事件
@@ -787,6 +785,7 @@ const TOOLS = [
 
 async function agentLoop(messages) {
   while (true) {
+    flow.llmRequest(messages.length, SYSTEM);
     const response = await client.messages.create({
       model: MODEL,
       system: SYSTEM,
@@ -794,6 +793,7 @@ async function agentLoop(messages) {
       tools: TOOLS,
       max_tokens: 8000,
     });
+    flow.llmResponse(response);
 
     messages.push({ role: "assistant", content: response.content });
 
@@ -809,8 +809,10 @@ async function agentLoop(messages) {
         } catch (e) {
           output = `错误：${e.message}`;
         }
-        console.log(`\x1b[33m> ${block.name}:\x1b[0m`);
-        console.log(String(output).slice(0, 200));
+        if (block.name.startsWith("worktree_") || block.name.startsWith("task_")) {
+          flow.infra(block.name, block.input);
+        }
+        flow.toolUse(block, output);
         results.push({
           type: "tool_result",
           tool_use_id: block.id,
@@ -823,6 +825,7 @@ async function agentLoop(messages) {
 }
 
 async function main() {
+  flow.infra("启动", { repoRoot: REPO_ROOT, workdir: WORKDIR });
   console.log(`s12 仓库根目录：${REPO_ROOT}`);
   if (!WORKTREES.gitAvailable) {
     console.log("注意：不在 git 仓库中。worktree_* 工具将返回错误。");
@@ -851,12 +854,13 @@ async function main() {
     if (!query || ["q", "exit"].includes(query.trim().toLowerCase())) break;
 
     history.push({ role: "user", content: query });
+    flow.userTurn(query);
     await agentLoop(history);
 
     const last = history[history.length - 1];
     if (Array.isArray(last.content)) {
       for (const block of last.content) {
-        if (block.type === "text") process.stdout.write(block.text);
+        if (block.type === "text") process.stdout.write(`LLM 回复：${block.text}`);
       }
     }
     console.log();
@@ -866,6 +870,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(err);
+  console.error("程序异常：", err);
   process.exit(1);
 });
